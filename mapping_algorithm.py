@@ -124,21 +124,36 @@ class mapping:
             mystr += "\n"
         skw, mn, mx = self.skew()
         mystr += f"skew: {skw} min shards/srvr: {mn} max shards/srvr: {mx}\n"
-        mystr += f"stddev: {self.stddev():0.3f} stderr (sigma/mu): {self.stderr():0.4f}\n"
+        mystr += (
+            f"stddev: {self.stddev():0.3f} stderr (sigma/mu): {self.stderr():0.4f}\n"
+        )
         return mystr
 
 
 if __name__ == "__main__":
-    m = mapping()
-    for i in range(10):
-        m.add_server_at_end()
-    print(m)
-    print(m.ring())
-    m.remove_random_server()
-    print(m.ring())
-    m.remove_random_server()
-    print(m.ring())
-    m.remove_random_server()
-    print(m.ring())
-    m.add_server_at_end()
-    print(m.ring())
+    # Sweep over commonly used ring sizes, shard counts, and tokens/server.
+    # N_servers fixed; stderr = sigma/mu of shards-per-server is the metric
+    # of interest — lower means more even shard granularity.
+
+    N_SERVERS = [5, 10, 100, 500]
+    RING_SIZES = [(1 << 32, "2^32"), (1 << 63, "2^63")]
+    SHARD_COUNTS = [64, 256, 1024, 4096]
+    TOKENS_PER_SERVER = [1, 3, 16, 64]
+
+    print(f"N_servers = {N_SERVERS}\n")
+    header = f"{'R':>6}  {'servers':>6}  {'shards':>6}  {'T':>4}  {'min':>4}  {'max':>4}  {'skew':>4}  {'stddev':>7}  {'sigma/mu':>8}"
+    for R, R_label in RING_SIZES:
+        print(header)
+        print("-" * len(header))
+        for shards in SHARD_COUNTS:
+            for T in TOKENS_PER_SERVER:
+                for n_servers in N_SERVERS:
+                    m = mapping(R=R, shards=shards, T=T)
+                    for _ in range(n_servers):
+                        m.add_server_at_end()
+                    skw, mn, mx = m.skew()
+                    print(
+                        f"{R_label:>6}  {n_servers:>6}  {shards:>6}  {T:>4}  {mn:>4}  {mx:>4}  "
+                        f"{skw:>4}  {m.stddev():>7.3f}  {m.stderr():>8.4f}"
+                    )
+        print()
