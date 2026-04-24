@@ -67,6 +67,11 @@ class mapping:
         lens = self._lens()
         return float(np.std(lens))
 
+    def stderr(self) -> float:
+        lens = self._lens()
+        mu = float(np.mean(lens))
+        return float(np.std(lens)) / mu if mu else 0.0
+
     def toks(self) -> Dict[int, List[int]]:
         rt = defaultdict(list)
         mp = self._token_to_server_list()
@@ -119,7 +124,7 @@ class mapping:
             mystr += "\n"
         skw, mn, mx = self.skew()
         mystr += f"skew: {skw} min shards/srvr: {mn} max shards/srvr: {mx}\n"
-        mystr += f"stddev: {self.stddev():0.3f}\n"
+        mystr += f"stddev: {self.stddev():0.3f} stderr (sigma/mu): {self.stderr():0.4f}\n"
         return mystr
 
 
