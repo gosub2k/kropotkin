@@ -19,14 +19,22 @@ from typing import Any, Callable
 
 class Status(Enum):
     UNKNOWN = 0   # seeded but not yet confirmed alive via comms
-    ALIVE = 1
-    SUSPECT = 2
-    DEAD = 3
+    JOINING = 1   # alive but hasn't claimed its `n` slot yet
+    ALIVE = 2     # alive and `n` claimed
+    SUSPECT = 3
+    DEAD = 4
 
 
-# Higher = more confident. ALIVE > UNKNOWN means any received message from a
-# peer (or gossip vouching for them) flips them out of the initial UNKNOWN.
-_ORDER = {Status.UNKNOWN: 0, Status.ALIVE: 1, Status.SUSPECT: 2, Status.DEAD: 3}
+# Higher = more confident. ALIVE > JOINING > UNKNOWN means any later news
+# about a peer wins; SUSPECT > ALIVE means a probe failure overrides ALIVE
+# at the same incarnation (refutation is by incarnation bump).
+_ORDER = {
+    Status.UNKNOWN: 0,
+    Status.JOINING: 1,
+    Status.ALIVE: 2,
+    Status.SUSPECT: 3,
+    Status.DEAD: 4,
+}
 
 
 class CommLog:
@@ -290,6 +298,8 @@ class Node:
         suspicion_timeout: float = 3.0,
         poll_cap: float = 0.1,
         k_indirect: int = 2,
+        claim_interval: float = 0.5,
+        claim_grace: float = 2.0,
         comm_log: CommLog | None = None,
     ):
         self.node_id = node_id
@@ -301,6 +311,8 @@ class Node:
         self.suspicion_timeout = suspicion_timeout
         self.poll_cap = poll_cap
         self.k_indirect = k_indirect
+        self.claim_interval = claim_interval
+        self.claim_grace = claim_grace
         self.comm_log = comm_log or CommLog(capacity=0)
 
         self.members: dict[int, Member] = {}
@@ -311,13 +323,15 @@ class Node:
         self.loop_last_ran: dict[str, float] = {}
 
         transport.register(node_id)
-        self.members[node_id] = Member(node_id, 0, Status.ALIVE)
-        # Seeds start UNKNOWN — promoted to ALIVE only after we receive a
-        # message proving they're up. Avoids the "everything looks fine"
-        # initial view when the cluster hasn't actually communicated yet.
+        # Self starts JOINING — we transition to ALIVE only once we've claimed
+        # our `n` slot (default = node_id; reshuffled if already taken).
+        self.members[node_id] = Member(node_id, 0, Status.JOINING)
+        # Seeds start UNKNOWN — promoted only when we receive a message from
+        # them. Avoids the "everything looks fine" initial view.
         for pid in seeds:
             if pid != node_id:
                 self.members.setdefault(pid, Member(pid, 0, Status.UNKNOWN))
+        self._claim_started = now()
 
     def put(self, key: str, value: Any) -> None:
         prev = self.state.get(key)
@@ -340,6 +354,7 @@ class Node:
             self._probe_loop(stop),
             self._gossip_loop(stop),
             self._expire_loop(stop),
+            self._claim_loop(stop),
         )
 
     async def _recv_loop(self, stop: asyncio.Event) -> None:
@@ -391,6 +406,72 @@ class Node:
                     return
                 except Exception as exc:
                     self.comm_log.event(f"expire_loop ERROR: {exc!r}")
+
+    async def _claim_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await asyncio.sleep(self.claim_interval)
+            if not stop.is_set():
+                try:
+                    self._try_claim()
+                    self.loop_last_ran["claim"] = now()
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    self.comm_log.event(f"claim_loop ERROR: {exc!r}")
+
+    def _try_claim(self) -> None:
+        # Wait for at least one peer to be heard from before claiming, unless
+        # the grace window has elapsed (so a single-node cluster still claims).
+        heard_peer = any(
+            m.status != Status.UNKNOWN
+            for nid, m in self.members.items()
+            if nid != self.node_id
+        )
+        if not heard_peer and now() - self._claim_started < self.claim_grace:
+            return
+
+        # Read all `n:*` claims out of the gossiped state.
+        claims: dict[int, int] = {}
+        for k, e in self.state.items():
+            if k.startswith("n:"):
+                try:
+                    claims[int(k[2:])] = int(e.value)
+                except (ValueError, TypeError):
+                    continue
+
+        my_n = claims.get(self.node_id)
+        others = {n: nid for nid, n in claims.items() if nid != self.node_id}
+
+        # Conflict: another node claims the same n. Lower node_id wins.
+        conflict = my_n in others and others[my_n] < self.node_id
+
+        if my_n is not None and not conflict:
+            self._become_alive()
+            return
+
+        # Pick own node_id by default; if taken, walk up to the lowest free n.
+        candidate = self.node_id
+        while candidate in others:
+            candidate += 1
+        self.put(f"n:{self.node_id}", candidate)
+        if conflict and my_n is not None:
+            self.comm_log.event(
+                f"claim n={candidate} (was {my_n}, lost to node{others[my_n]})"
+            )
+        else:
+            self.comm_log.event(f"claim n={candidate}")
+        self._become_alive()
+
+    def _become_alive(self) -> None:
+        # Direct transition because _apply() for self only handles refutation.
+        me = self.members[self.node_id]
+        if me.status == Status.ALIVE:
+            return
+        self.incarnation = me.incarnation + 1
+        self.members[self.node_id] = Member(self.node_id, self.incarnation, Status.ALIVE)
+        self.comm_log.event(
+            f"member {self.node_id}: {me.status.name} → ALIVE (inc {self.incarnation})"
+        )
 
     async def _handle(self, msg: Message):
         if msg.kind == "ping":
@@ -482,9 +563,13 @@ class Node:
                 self.state[k] = Entry(v, ver)
 
     def _apply(self, update: Member):
-        # Rebut any rumor that I'm not alive by bumping my own incarnation.
+        # Rebut SUSPECT/DEAD rumours about ourselves by bumping incarnation.
+        # Ignore JOINING/UNKNOWN/ALIVE echoes — those don't threaten our view.
         if update.node_id == self.node_id:
-            if update.status != Status.ALIVE and update.incarnation >= self.incarnation:
+            if (
+                update.status in (Status.SUSPECT, Status.DEAD)
+                and update.incarnation >= self.incarnation
+            ):
                 self.incarnation = update.incarnation + 1
                 self.members[self.node_id] = Member(
                     self.node_id, self.incarnation, Status.ALIVE

@@ -27,9 +27,9 @@ def vdc(i: int, base=2) -> float:
 @dataclass
 class mapping:
 
-    R: int = 1 << 63
-    shards: int = 32
-    T: int = 3
+    R: int = 1 << 31
+    shards: int = 1 << 9
+    T: int = 5
     B: int = 2
     S: int = 100069
     seq: Callable[[int, int], float] = vdc
@@ -123,9 +123,9 @@ class mapping:
                 mystr += " ... "
             mystr += "\n"
         skw, mn, mx = self.skew()
-        mystr += f"skew: {skw} min shards/srvr: {mn} max shards/srvr: {mx}\n"
+        mystr += f"skew: {skw}, min shards/srvr: {mn}, max shards/srvr: {mx}\n"
         mystr += (
-            f"stddev: {self.stddev():0.3f} stderr (sigma/mu): {self.stderr():0.4f}\n"
+            f"stddev: {self.stddev():0.3f}, stderr (sigma/mu): {self.stderr():0.4f}\n"
         )
         return mystr
 
