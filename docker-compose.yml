@@ -1,0 +1,67 @@
+x-node-env: &node-env
+  USE_UDP: "1"
+  NODE_HOSTS: "node0,node1,node2,node3,node4"
+  UDP_BASE: "9000"
+  # Shorter timeouts than the library defaults so failure detection is visible
+  # within a few seconds: SUSPECT after ~1s of no response, DEAD after ~2s more.
+  PING_TIMEOUT: "1.0"
+  SUSPICION_TIMEOUT: "2.0"
+
+x-healthcheck: &healthcheck
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/status')"]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 5s
+
+services:
+  node0:
+    build: .
+    <<: *healthcheck
+    environment:
+      <<: *node-env
+      NODE_ID: "0"
+      SEEDS: "1,2,3,4"
+    ports:
+      - "8000:8000"
+
+  node1:
+    build: .
+    <<: *healthcheck
+    environment:
+      <<: *node-env
+      NODE_ID: "1"
+      SEEDS: "0,2,3,4"
+    ports:
+      - "8001:8000"
+
+  node2:
+    build: .
+    <<: *healthcheck
+    environment:
+      <<: *node-env
+      NODE_ID: "2"
+      SEEDS: "0,1,3,4"
+    ports:
+      - "8002:8000"
+
+  node3:
+    build: .
+    <<: *healthcheck
+    environment:
+      <<: *node-env
+      NODE_ID: "3"
+      SEEDS: "0,1,2,4"
+    ports:
+      - "8003:8000"
+
+  node4:
+    build: .
+    <<: *healthcheck
+    environment:
+      <<: *node-env
+      NODE_ID: "4"
+      SEEDS: "0,1,2,3"
+    ports:
+      - "8004:8000"

@@ -1,23 +1,62 @@
 """SWIM-style gossip: membership with alive/suspect/dead + incarnation
 numbers, plus push-pull anti-entropy of opaque key/value state.
 
-The transport is an in-process mailbox so the whole protocol can be run
-as a simulation. Replace Transport with a UDP socket to take it live.
+Async, driven by a real monotonic clock. Each node runs as its own
+coroutine. Swap MockTransport for UDPTransport to take it live.
 """
 
+import asyncio
+import pickle
 import random
+import socket
+import time
+from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 
 class Status(Enum):
+    UNKNOWN = 0   # seeded but not yet confirmed alive via comms
     ALIVE = 1
     SUSPECT = 2
     DEAD = 3
 
 
-_ORDER = {Status.ALIVE: 0, Status.SUSPECT: 1, Status.DEAD: 2}
+# Higher = more confident. ALIVE > UNKNOWN means any received message from a
+# peer (or gossip vouching for them) flips them out of the initial UNKNOWN.
+_ORDER = {Status.UNKNOWN: 0, Status.ALIVE: 1, Status.SUSPECT: 2, Status.DEAD: 3}
+
+
+class CommLog:
+    """In-memory ring buffer of node-communication events, optionally
+    mirrored to a stream (typically sys.stderr) so events appear live in
+    `docker logs`. The ring buffer remains queryable via /debug/log."""
+
+    def __init__(self, capacity: int = 2000, stream=None):
+        self._buf: deque[str] | None = (
+            deque(maxlen=capacity) if capacity > 0 else None
+        )
+        self._stream = stream
+        self._t0 = time.monotonic()
+
+    def event(self, msg: str) -> None:
+        t = time.monotonic() - self._t0
+        line = f"{t:9.3f}s {msg}"
+        if self._buf is not None:
+            self._buf.append(line)
+        if self._stream is not None:
+            print(f"[comm] {line}", file=self._stream, flush=True)
+
+    def tail(self, n: int = 200) -> list[str]:
+        if self._buf is None:
+            return []
+        return list(self._buf)[-n:]
+
+
+def now() -> float:
+    return time.monotonic()
 
 
 @dataclass
@@ -45,61 +84,242 @@ class Message:
     payload: dict = field(default_factory=dict)
 
 
-class Transport:
-    """In-memory mailbox. Drops messages to killed nodes and (stochastically)
-    a fraction of all others to model a lossy network."""
+class Transport(ABC):
+    """Abstract transport — defines how nodes exchange Message objects."""
 
-    def __init__(self, drop_rate: float = 0.0):
-        self.mailboxes: dict[int, list[Message]] = {}
+    @abstractmethod
+    def register(self, node_id: int) -> None: ...
+
+    @abstractmethod
+    async def send(self, to: int, msg: Message) -> None: ...
+
+    @abstractmethod
+    async def recv(self, node_id: int, timeout: float) -> Message | None: ...
+
+    @abstractmethod
+    def drain(self, node_id: int) -> list[Message]: ...
+
+    async def setup(self, node_id: int) -> None:  # noqa: ARG002
+        """Optional async initialisation called by Node.run() before the loop."""
+
+    def debug_info(self) -> dict:
+        """Transport-level counters for the /status endpoint."""
+        return {}
+
+
+class MockTransport(Transport):
+    """In-memory async mailbox with optional drop rate and exponential
+    delivery latency. Each registered node has an asyncio.Queue."""
+
+    def __init__(self, drop_rate: float = 0.0, latency: float = 0.0):
+        self.queues: dict[int, asyncio.Queue[Message]] = {}
         self.drop_rate = drop_rate
+        self.latency = latency
         self.dead: set[int] = set()
 
-    def register(self, node_id: int):
-        self.mailboxes.setdefault(node_id, [])
+    def register(self, node_id: int) -> None:
+        self.queues.setdefault(node_id, asyncio.Queue())
 
-    def send(self, to: int, msg: Message):
+    async def send(self, to: int, msg: Message) -> None:
         if to in self.dead or msg.sender in self.dead:
             return
         if random.random() < self.drop_rate:
             return
-        self.mailboxes.setdefault(to, []).append(msg)
+        if self.latency > 0:
+            await asyncio.sleep(random.expovariate(1.0 / self.latency))
+            if to in self.dead:
+                return
+        await self.queues[to].put(msg)
 
-    def recv(self, node_id: int) -> list[Message]:
-        msgs = self.mailboxes.get(node_id, [])
-        self.mailboxes[node_id] = []
-        return msgs
+    async def recv(self, node_id: int, timeout: float) -> Message | None:
+        try:
+            return await asyncio.wait_for(self.queues[node_id].get(), timeout)
+        except asyncio.TimeoutError:
+            return None
 
-    def kill(self, node_id: int):
+    def drain(self, node_id: int) -> list[Message]:
+        q = self.queues[node_id]
+        out: list[Message] = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+
+    def kill(self, node_id: int) -> None:
         self.dead.add(node_id)
-        self.mailboxes[node_id] = []
 
 
-@dataclass
+class _UDPProtocol(asyncio.DatagramProtocol):
+    def __init__(
+        self,
+        queue: asyncio.Queue[Message],
+        on_recv: "Callable[[Message | None, int, Exception | None], None]",
+    ):
+        self._queue = queue
+        self._on_recv = on_recv
+
+    def datagram_received(self, data: bytes, addr: tuple) -> None:  # noqa: ARG002
+        try:
+            msg = pickle.loads(data)
+        except Exception as exc:
+            self._on_recv(None, len(data), exc)
+            return
+        try:
+            self._queue.put_nowait(msg)
+        except Exception:
+            pass
+        self._on_recv(msg, len(data), None)
+
+    def error_received(self, exc: Exception) -> None:  # noqa: ARG002
+        pass
+
+    def connection_lost(self, exc: Exception | None) -> None:  # noqa: ARG002
+        pass
+
+
+class UDPTransport(Transport):
+    """Real UDP transport. Provide a mapping from node_id → (host, port).
+    Node.run() calls setup() which resolves all hostnames and binds the
+    listening socket. Hostnames are resolved once so send() never does
+    blocking DNS — asyncio.DatagramTransport.sendto() with an unresolved
+    hostname can call _fatal_error() and permanently close the transport."""
+
+    def __init__(
+        self,
+        node_map: dict[int, tuple[str, int]],
+        comm_log: CommLog | None = None,
+    ):
+        self._node_map = node_map
+        self._queues: dict[int, asyncio.Queue[Message]] = {}
+        self._sockets: dict[int, asyncio.DatagramTransport] = {}
+        self._resolved: dict[int, tuple[str, int]] = {}
+        self._sends = 0
+        self._recvs = 0
+        self._send_errors = 0
+        self._comm = comm_log or CommLog(capacity=0)
+
+    def register(self, node_id: int) -> None:
+        self._queues.setdefault(node_id, asyncio.Queue())
+
+    async def setup(self, node_id: int) -> None:
+        loop = asyncio.get_running_loop()
+        # Resolve every peer hostname → IP once. Peers may not yet be in DNS
+        # (Docker only registers a service in DNS once its container starts),
+        # so retry with backoff. Self has to resolve to bind, so that's the
+        # only one we treat as fatal.
+        for nid, (host, port) in self._node_map.items():
+            for attempt in range(30):
+                try:
+                    infos = await loop.getaddrinfo(
+                        host, port, family=socket.AF_INET, type=socket.SOCK_DGRAM
+                    )
+                    ip, port = infos[0][4][:2]
+                    self._resolved[nid] = (str(ip), int(port))
+                    break
+                except OSError as exc:
+                    if nid == node_id:
+                        raise
+                    if attempt == 29:
+                        self._comm.event(f"setup: gave up resolving {host}: {exc}")
+                    else:
+                        await asyncio.sleep(1.0)
+        self._comm.event(f"setup node={node_id} resolved={self._resolved}")
+        queue = self._queues[node_id]
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: _UDPProtocol(queue, self._on_recv),
+            local_addr=self._resolved[node_id],
+        )
+        self._sockets[node_id] = transport  # type: ignore[assignment]
+        self._comm.event(f"bound {self._resolved[node_id]}")
+
+    def _on_recv(self, msg: Message | None, size: int, exc: Exception | None) -> None:
+        if exc is not None or msg is None:
+            self._comm.event(f"recv malformed {size}B: {exc}")
+            return
+        self._recvs += 1
+        self._comm.event(f"recv ← {msg.sender} {msg.kind} {size}B")
+
+    async def send(self, to: int, msg: Message) -> None:
+        data = pickle.dumps(msg)
+        dest = self._resolved.get(to) or self._node_map[to]
+        owned = self._sockets.get(msg.sender)
+        try:
+            if owned is not None:
+                owned.sendto(data, dest)
+            else:
+                loop = asyncio.get_running_loop()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setblocking(False)
+                try:
+                    await loop.sock_sendto(sock, data, dest)
+                finally:
+                    sock.close()
+            self._sends += 1
+            self._comm.event(f"send → {to} {msg.kind} {len(data)}B → {dest}")
+        except Exception as exc:
+            self._send_errors += 1
+            self._comm.event(f"send fail → {to} {msg.kind}: {exc}")
+
+    def debug_info(self) -> dict:
+        return {"sends": self._sends, "recvs": self._recvs, "send_errors": self._send_errors}
+
+    async def recv(self, node_id: int, timeout: float) -> Message | None:
+        try:
+            return await asyncio.wait_for(self._queues[node_id].get(), timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    def drain(self, node_id: int) -> list[Message]:
+        q = self._queues[node_id]
+        out: list[Message] = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+
+
 class Node:
-    node_id: int
-    transport: Transport
-    fanout: int = 3
-    ping_timeout: int = 2
-    suspicion_timeout: int = 5
-    k_indirect: int = 2
+    def __init__(
+        self,
+        node_id: int,
+        seeds: list[int],
+        transport: Transport,
+        *,
+        fanout: int = 3,
+        gossip_interval: float = 0.5,
+        probe_interval: float = 0.5,
+        ping_timeout: float = 1.0,
+        suspicion_timeout: float = 3.0,
+        poll_cap: float = 0.1,
+        k_indirect: int = 2,
+        comm_log: CommLog | None = None,
+    ):
+        self.node_id = node_id
+        self.transport = transport
+        self.fanout = fanout
+        self.gossip_interval = gossip_interval
+        self.probe_interval = probe_interval
+        self.ping_timeout = ping_timeout
+        self.suspicion_timeout = suspicion_timeout
+        self.poll_cap = poll_cap
+        self.k_indirect = k_indirect
+        self.comm_log = comm_log or CommLog(capacity=0)
 
-    members: dict[int, Member] = field(default_factory=dict)
-    state: dict[str, Entry] = field(default_factory=dict)
-    pending_pings: dict[int, int] = field(default_factory=dict)
-    suspect_since: dict[int, int] = field(default_factory=dict)
-    tick: int = 0
-    incarnation: int = 0
+        self.members: dict[int, Member] = {}
+        self.state: dict[str, Entry] = {}
+        self.pending_pings: dict[int, float] = {}
+        self.suspect_since: dict[int, float] = {}
+        self.incarnation: int = 0
+        self.loop_last_ran: dict[str, float] = {}
 
-    def __post_init__(self):
-        self.transport.register(self.node_id)
-        self.members[self.node_id] = Member(self.node_id, 0, Status.ALIVE)
-
-    def join(self, seeds: list[int]):
+        transport.register(node_id)
+        self.members[node_id] = Member(node_id, 0, Status.ALIVE)
+        # Seeds start UNKNOWN — promoted to ALIVE only after we receive a
+        # message proving they're up. Avoids the "everything looks fine"
+        # initial view when the cluster hasn't actually communicated yet.
         for pid in seeds:
-            if pid != self.node_id:
-                self.members.setdefault(pid, Member(pid, 0, Status.ALIVE))
+            if pid != node_id:
+                self.members.setdefault(pid, Member(pid, 0, Status.UNKNOWN))
 
-    def put(self, key: str, value: Any):
+    def put(self, key: str, value: Any) -> None:
         prev = self.state.get(key)
         self.state[key] = Entry(value, (prev.version if prev else 0) + 1)
 
@@ -108,21 +328,74 @@ class Node:
         return e.value if e else None
 
     def live_peers(self) -> list[int]:
-        return [m.node_id for m in self.members.values()
-                if m.node_id != self.node_id and m.status != Status.DEAD]
+        return [
+            m.node_id for m in self.members.values()
+            if m.node_id != self.node_id and m.status != Status.DEAD
+        ]
 
-    def step(self):
-        self.tick += 1
-        for msg in self.transport.recv(self.node_id):
-            self._handle(msg)
-        self._expire()
-        self._probe()
-        self._gossip()
+    async def run(self, stop: asyncio.Event) -> None:
+        await self.transport.setup(self.node_id)
+        await asyncio.gather(
+            self._recv_loop(stop),
+            self._probe_loop(stop),
+            self._gossip_loop(stop),
+            self._expire_loop(stop),
+        )
 
-    def _handle(self, msg: Message):
+    async def _recv_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                msg = await self.transport.recv(self.node_id, self.poll_cap)
+                self.loop_last_ran["recv"] = now()
+                if msg is not None:
+                    await self._handle(msg)
+                    for extra in self.transport.drain(self.node_id):
+                        await self._handle(extra)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                self.comm_log.event(f"recv_loop ERROR: {exc!r}")
+
+    async def _probe_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await asyncio.sleep(self.probe_interval)
+            if not stop.is_set():
+                try:
+                    await self._probe()
+                    self.loop_last_ran["probe"] = now()
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    self.comm_log.event(f"probe_loop ERROR: {exc!r}")
+
+    async def _gossip_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await asyncio.sleep(self.gossip_interval)
+            if not stop.is_set():
+                try:
+                    await self._gossip()
+                    self.loop_last_ran["gossip"] = now()
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    self.comm_log.event(f"gossip_loop ERROR: {exc!r}")
+
+    async def _expire_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await asyncio.sleep(self.poll_cap)
+            if not stop.is_set():
+                try:
+                    await self._expire()
+                    self.loop_last_ran["expire"] = now()
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    self.comm_log.event(f"expire_loop ERROR: {exc!r}")
+
+    async def _handle(self, msg: Message):
         if msg.kind == "ping":
             self._merge(msg.payload)
-            self._send(msg.sender, "ack", relay=msg.payload.get("relay"))
+            await self._send(msg.sender, "ack", relay=msg.payload.get("relay"))
             return
         if msg.kind == "ack":
             self.pending_pings.pop(msg.sender, None)
@@ -132,63 +405,73 @@ class Node:
                 self._apply(Member(msg.sender, existing.incarnation + 1, Status.ALIVE))
             relay = msg.payload.get("relay")
             if relay is not None and relay != self.node_id:
-                # indirect probe: forward liveness evidence back to requester
-                self._send(relay, "ack")
+                # Indirect probe: forward liveness evidence back to the requester.
+                await self._send(relay, "ack")
             return
         if msg.kind == "ping_req":
             target = msg.payload["target"]
-            self._send(target, "ping", relay=msg.sender)
+            await self._send(target, "ping", relay=msg.sender)
             return
         if msg.kind == "sync":
             self._merge(msg.payload)
 
-    def _probe(self):
+    async def _probe(self):
         peers = self.live_peers()
         if not peers:
             return
         target = random.choice(peers)
         if target in self.pending_pings:
+            self.comm_log.event(f"probe skip {target} (already pending)")
             return
-        self.pending_pings[target] = self.tick
-        self._send(target, "ping")
+        self.pending_pings[target] = now()
+        self.comm_log.event(f"probe → {target}")
+        await self._send(target, "ping")
 
-    def _gossip(self):
+    async def _gossip(self):
         peers = self.live_peers()
         if not peers:
             return
         for peer in random.sample(peers, min(self.fanout, len(peers))):
-            self._send(peer, "sync")
+            await self._send(peer, "sync")
 
-    def _expire(self):
+    async def _expire(self):
+        t = now()
         for target, sent in list(self.pending_pings.items()):
-            if self.tick - sent < self.ping_timeout:
+            if t - sent < self.ping_timeout:
                 continue
             self.pending_pings.pop(target, None)
+            self.comm_log.event(f"ping_timeout {target} after {t - sent:.2f}s")
             helpers = [p for p in self.live_peers() if p != target]
-            for helper in random.sample(helpers, min(self.k_indirect, len(helpers))):
-                self.transport.send(helper, Message(
-                    self.node_id, "ping_req", {"target": target}))
+            chosen = random.sample(helpers, min(self.k_indirect, len(helpers)))
+            if chosen:
+                self.comm_log.event(f"indirect_probe via {chosen} for {target}")
+            for helper in chosen:
+                await self.transport.send(
+                    helper, Message(self.node_id, "ping_req", {"target": target})
+                )
             m = self.members.get(target)
             if m and m.status == Status.ALIVE:
                 self._apply(Member(target, m.incarnation, Status.SUSPECT))
-                self.suspect_since[target] = self.tick
+                self.suspect_since[target] = t
         for nid, since in list(self.suspect_since.items()):
-            if self.tick - since < self.suspicion_timeout:
+            if t - since < self.suspicion_timeout:
                 continue
             m = self.members.get(nid)
             if m and m.status == Status.SUSPECT:
                 self._apply(Member(nid, m.incarnation, Status.DEAD))
             self.suspect_since.pop(nid, None)
 
-    def _send(self, to: int, kind: str, relay: int | None = None):
+    async def _send(self, to: int, kind: str, relay: int | None = None):
         payload = {
-            "members": [(m.node_id, m.incarnation, m.status.value)
-                        for m in self.members.values()],
+            "members": [
+                (m.node_id, m.incarnation, m.status.value)
+                for m in self.members.values()
+            ],
             "state": {k: (e.value, e.version) for k, e in self.state.items()},
         }
         if relay is not None:
             payload["relay"] = relay
-        self.transport.send(to, Message(self.node_id, kind, payload))
+        await self.transport.send(to, Message(self.node_id, kind, payload))
 
     def _merge(self, payload: dict):
         for nid, inc, sv in payload.get("members", []):
@@ -204,50 +487,67 @@ class Node:
             if update.status != Status.ALIVE and update.incarnation >= self.incarnation:
                 self.incarnation = update.incarnation + 1
                 self.members[self.node_id] = Member(
-                    self.node_id, self.incarnation, Status.ALIVE)
+                    self.node_id, self.incarnation, Status.ALIVE
+                )
             return
         existing = self.members.get(update.node_id)
         if not existing or update.supersedes(existing):
+            old = existing.status.name if existing else "NEW"
+            self.comm_log.event(
+                f"member {update.node_id}: {old} → {update.status.name} "
+                f"(inc {update.incarnation})"
+            )
             self.members[update.node_id] = update
             if update.status == Status.ALIVE:
                 self.suspect_since.pop(update.node_id, None)
 
 
-def simulate(n_nodes: int = 6, ticks: int = 40, drop_rate: float = 0.05,
-             kill_at: dict[int, int] | None = None, seed: int = 42):
+async def simulate(n_nodes: int = 6, duration: float = 12.0,
+                   drop_rate: float = 0.05, latency: float = 0.02,
+                   kill_at: dict[float, int] | None = None, seed: int = 42):
     random.seed(seed)
-    transport = Transport(drop_rate=drop_rate)
-    nodes = [Node(i, transport) for i in range(n_nodes)]
-    # Everyone joins through node 0; node 0 is seeded with the full roster.
-    nodes[0].join(list(range(n_nodes)))
-    for n in nodes[1:]:
-        n.join([0])
+    transport = MockTransport(drop_rate=drop_rate, latency=latency)
+    all_ids = list(range(n_nodes))
+    nodes = [Node(0, all_ids, transport)]
+    nodes += [Node(i, [0], transport) for i in range(1, n_nodes)]
 
-    kill_at = kill_at or {}
-    for t in range(ticks):
-        if t in kill_at:
-            victim = kill_at[t]
+    stop = asyncio.Event()
+    tasks = [asyncio.create_task(n.run(stop)) for n in nodes]
+    t0 = now()
+
+    async def scenario():
+        await asyncio.sleep(0.5)
+        nodes[0].put("leader", "node-0")
+        nodes[1].put("build", "v1.2.3")
+        for at, victim in sorted((kill_at or {}).items()):
+            delay = (t0 + at) - now()
+            if delay > 0:
+                await asyncio.sleep(delay)
             transport.kill(victim)
-            print(f"tick {t}: killed node {victim}")
-        if t == 2:
-            nodes[0].put("leader", "node-0")
-            nodes[1].put("build", "v1.2.3")
-        if t == 18:
-            nodes[3].put("leader", "node-3")  # leader change post-kill
-        for n in nodes:
-            if n.node_id not in transport.dead:
-                n.step()
+            print(f"t={now() - t0:5.2f}s: killed node {victim}")
+        remaining = (t0 + duration) - now()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        stop.set()
+
+    await scenario()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
     print("\n=== final view per node ===")
     for n in nodes:
         if n.node_id in transport.dead:
             print(f"node {n.node_id}: <killed>")
             continue
-        members = {m.node_id: m.status.name for m in sorted(
-            n.members.values(), key=lambda x: x.node_id)}
+        members = {
+            m.node_id: m.status.name
+            for m in sorted(n.members.values(), key=lambda x: x.node_id)
+        }
         state = {k: e.value for k, e in n.state.items()}
         print(f"node {n.node_id}: members={members} state={state}")
 
 
 if __name__ == "__main__":
-    simulate(n_nodes=6, ticks=35, drop_rate=0.1, kill_at={14: 2})
+    asyncio.run(simulate(
+        n_nodes=6, duration=12.0, drop_rate=0.05, latency=0.02,
+        kill_at={3.0: 2},
+    ))
