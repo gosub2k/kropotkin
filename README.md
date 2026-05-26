@@ -4,11 +4,11 @@
 
 ## Mapping algorithm
 
-A consistent-hashing token placement scheme using the [van der Corput (VdC) sequence](https://en.wikipedia.org/wiki/Van_der_Corput_sequence) instead of random positions. (No claim is made that this is better than some deterministic pseudo-random sequence. Indeed the example above shows adjacent tokens belonging to the same node for three of the nodes in the ring. The code allows different sequences to be plugged in.)
+A consistent-hashing token placement scheme using the [van der Corput (VdC) sequence](https://en.wikipedia.org/wiki/Van_der_Corput_sequence) instead of random positions. 
 
-The naive approach — assigning each server a consecutive block of VdC values — is pathological: because consecutive VdC blocks are exact ring-translates of one another, all of a failed server's positions share the same clockwise successor, collapsing failover load onto a single node regardless of token count.
+No claim is made that this acheme is better than some deterministic pseudo-random sequence - which might require sharing a similar amount of information between the nodes, ie the random seed. (Indeed the example above shows adjacent tokens belonging to the same node for three of the nodes in the ring.) The goal here was to increase understanding of VdC sequences. It does look like the approach here is better than a more naive approach which would be to assign each server a consecutive block of VdC values (Consecutive VdC blocks are exact ring-translates of one another, all of a failed server's positions share the same clockwise successor, collapsing failover load onto a single node regardless of token count.)
 
-The fix (suggested by Claude!): assign tokens by residue class mod `S` (where `gcd(S, base) = 1`). Server `N` owns positions `{ vdc(N + tS) : t = 0, …, T−1 }`. This preserves the low-discrepancy property per server while breaking the translation coupling. See [vdc-consistent-hashing.md](vdc-consistent-hashing.md) for the full derivation.
+This scheme is (suggested by Claude!): assign tokens by residue class mod `S` (where `gcd(S, base) = 1`). Server `N` owns positions `{ vdc(N + tS) : t = 0, …, T−1 }`. This preserves the low-discrepancy property per server while breaking the translation coupling. See [vdc-consistent-hashing.md](vdc-consistent-hashing.md) for the full derivation.
 
 Inspired by <!-- TODO: Rocksteady/VDC paper ref --> applied to consistent hash rings. The only state each node needs to communicate is its residue class mod `S`.
 
