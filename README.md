@@ -8,9 +8,11 @@ A consistent-hashing token placement scheme using the [van der Corput (VdC) sequ
 
 No claim is made that this acheme is better than some deterministic pseudo-random sequence - which might require sharing a similar amount of information between the nodes, ie the random seed. (Indeed the example above shows adjacent tokens belonging to the same node for three of the nodes in the ring.) The goal here was to increase understanding of VdC sequences. It does look like the approach here is better than a more naive approach which would be to assign each server a consecutive block of VdC values (Consecutive VdC blocks are exact ring-translates of one another, all of a failed server's positions share the same clockwise successor, collapsing failover load onto a single node regardless of token count.)
 
-This scheme is (suggested by Claude!): assign tokens by residue class mod `S` (where `gcd(S, base) = 1`). Server `N` owns positions `{ vdc(N + tS) : t = 0, …, T−1 }`. This preserves the low-discrepancy property per server while breaking the translation coupling. See [vdc-consistent-hashing.md](vdc-consistent-hashing.md) for the full derivation.
+The scheme here is (suggested by Claude!): assign tokens by residue class mod `S` (where `gcd(S, base) = 1`). Server `N` owns positions `{ vdc(N + tS) : t = 0, …, T−1 }`. This preserves the low-discrepancy property per server while breaking the translation coupling, ie failover load distribution should be better than using consecutive blocks of VdC values.
 
 Inspired by <!-- TODO: Rocksteady/VDC paper ref --> applied to consistent hash rings. The only state each node needs to communicate is its residue class mod `S`.
+
+If this all sounds confusing yet potentially interesting, the Dynamo DB paper is a good place to start.
 
 **Design parameters**
 
